@@ -28,7 +28,6 @@ use crate::client::{
 use crate::completion::GetTokenUsage;
 use crate::http_client::sse::{Event, GenericEventSource};
 use crate::http_client::{self, HttpClientExt};
-use crate::json_utils::empty_or_none;
 use crate::providers::openai::{self, StreamingToolCall};
 use crate::{
     completion::{self, CompletionError, CompletionRequest},
@@ -382,10 +381,21 @@ where
 // Streaming Support
 // ================================================================
 
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum FinishReason {
+    ToolCalls,
+    Stop,
+    #[serde(other)]
+    Other,
+}
+
 #[derive(Deserialize, Debug)]
 struct StreamingDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default, deserialize_with = "json_utils::null_or_vec")]
     tool_calls: Vec<StreamingToolCall>,
 }
@@ -393,6 +403,7 @@ struct StreamingDelta {
 #[derive(Deserialize, Debug)]
 struct StreamingChoice {
     delta: StreamingDelta,
+    finish_reason: Option<FinishReason>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -437,7 +448,7 @@ where
             total_tokens: 0,
             prompt_tokens_details: None,
         };
-        let mut calls: HashMap<usize, (String, String, String)> = HashMap::new();
+        let mut calls: HashMap<usize, crate::streaming::RawStreamingToolCall> = HashMap::new();
 
         while let Some(event_result) = event_source.next().await {
             match event_result {
@@ -451,6 +462,8 @@ where
                         continue;
                     }
 
+                    tracing::debug!(target: "rig", "Lemonade SSE: {}", data_str);
+
                     let parsed = serde_json::from_str::<StreamingCompletionChunk>(data_str);
                     let Ok(data) = parsed else {
                         let err = parsed.unwrap_err();
@@ -458,49 +471,73 @@ where
                         continue;
                     };
 
-                    if let Some(choice) = data.choices.first() {
-                        let delta = &choice.delta;
+                    if let Some(usage) = data.usage {
+                        final_usage = usage;
+                    }
 
-                        for tool_call in &delta.tool_calls {
-                            let function = &tool_call.function;
+                    let Some(choice) = data.choices.first() else {
+                        continue;
+                    };
+                    let delta = &choice.delta;
 
-                            if function.name.as_ref().map(|s| !s.is_empty()).unwrap_or(false)
-                                && empty_or_none(&function.arguments)
-                            {
-                                let id = tool_call.id.clone().unwrap_or_default();
-                                let name = function.name.clone().unwrap();
-                                calls.insert(tool_call.index, (id, name, String::new()));
-                            } else if function.name.as_ref().map(|s| s.is_empty()).unwrap_or(true)
-                                && let Some(arguments) = &function.arguments
-                                && !arguments.is_empty()
-                            {
-                                if let Some((id, name, existing_args)) = calls.get(&tool_call.index) {
-                                    let combined = format!("{}{}", existing_args, arguments);
-                                    calls.insert(tool_call.index, (id.clone(), name.clone(), combined));
-                                }
-                            } else {
-                                let id = tool_call.id.clone().unwrap_or_default();
-                                let name = function.name.clone().unwrap_or_default();
-                                let arguments_str = function.arguments.clone().unwrap_or_default();
+                    for tool_call in &delta.tool_calls {
+                        let index = tool_call.index;
+                        let existing = calls.entry(index)
+                            .or_insert_with(crate::streaming::RawStreamingToolCall::empty);
 
-                                let Ok(arguments_json) = serde_json::from_str::<serde_json::Value>(&arguments_str) else {
-                                    tracing::debug!("Couldn't parse tool call args '{}'", arguments_str);
-                                    continue;
-                                };
-
-                                yield Ok(crate::streaming::RawStreamingChoice::ToolCall(
-                                    crate::streaming::RawStreamingToolCall::new(id, name, arguments_json)
-                                ));
-                            }
+                        if let Some(id) = &tool_call.id && !id.is_empty() {
+                            existing.id = id.clone();
                         }
 
-                        if let Some(content) = &delta.content {
-                            yield Ok(crate::streaming::RawStreamingChoice::Message(content.clone()));
+                        if let Some(name) = &tool_call.function.name && !name.is_empty() {
+                            existing.name = name.clone();
+                            yield Ok(crate::streaming::RawStreamingChoice::ToolCallDelta {
+                                id: existing.id.clone(),
+                                internal_call_id: existing.internal_call_id.clone(),
+                                content: crate::streaming::ToolCallDeltaContent::Name(name.clone()),
+                            });
+                        }
+
+                        if let Some(chunk) = &tool_call.function.arguments && !chunk.is_empty() {
+                            let current_args = match &existing.arguments {
+                                serde_json::Value::Null => String::new(),
+                                serde_json::Value::String(s) => s.clone(),
+                                v => v.to_string(),
+                            };
+                            let combined = format!("{current_args}{chunk}");
+                            if combined.trim_start().starts_with('{') && combined.trim_end().ends_with('}') {
+                                match serde_json::from_str(&combined) {
+                                    Ok(parsed) => existing.arguments = parsed,
+                                    Err(_) => existing.arguments = serde_json::Value::String(combined),
+                                }
+                            } else {
+                                existing.arguments = serde_json::Value::String(combined);
+                            }
+                            yield Ok(crate::streaming::RawStreamingChoice::ToolCallDelta {
+                                id: existing.id.clone(),
+                                internal_call_id: existing.internal_call_id.clone(),
+                                content: crate::streaming::ToolCallDeltaContent::Delta(chunk.clone()),
+                            });
                         }
                     }
 
-                    if let Some(usage) = data.usage {
-                        final_usage = usage;
+                    if let Some(finish_reason) = &choice.finish_reason
+                        && *finish_reason == FinishReason::ToolCalls
+                    {
+                        for (_, tool_call) in calls.drain() {
+                            tracing::debug!(target: "rig", "Lemonade emitting tool call on finish_reason: {}", tool_call.name);
+                            yield Ok(crate::streaming::RawStreamingChoice::ToolCall(tool_call));
+                        }
+                    }
+
+                    if let Some(r) = &delta.reasoning_content && !r.is_empty() {
+                        yield Ok(crate::streaming::RawStreamingChoice::ReasoningDelta {
+                            id: None,
+                            reasoning: r.clone(),
+                        });
+                    }
+                    if let Some(content) = &delta.content && !content.is_empty() {
+                        yield Ok(crate::streaming::RawStreamingChoice::Message(content.clone()));
                     }
                 }
                 Err(crate::http_client::Error::StreamEnded) => break,
@@ -514,13 +551,9 @@ where
 
         event_source.close();
 
-        for (_, (id, name, arguments)) in calls {
-            let Ok(arguments_json) = serde_json::from_str::<serde_json::Value>(&arguments) else {
-                continue;
-            };
-            yield Ok(crate::streaming::RawStreamingChoice::ToolCall(
-                crate::streaming::RawStreamingToolCall::new(id, name, arguments_json)
-            ));
+        for (_, tool_call) in calls {
+            tracing::debug!(target: "rig", "Lemonade flushing tool call: {}", tool_call.name);
+            yield Ok(crate::streaming::RawStreamingChoice::ToolCall(tool_call));
         }
 
         span.record("gen_ai.usage.input_tokens", final_usage.prompt_tokens);
