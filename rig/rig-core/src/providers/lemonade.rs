@@ -3,12 +3,15 @@
 //! [Lemonade](https://github.com/lemonade-sdk/lemonade) is AMD's unified local AI server
 //! that exposes an OpenAI-compatible API at `http://localhost:13305/api/v1` by default.
 //!
+//! The client expects the full OpenAI-compatible base URL including the `/api/v1` prefix,
+//! matching the convention used by other OpenAI-compatible servers (llama.cpp, vllm, etc.).
+//!
 //! # Example
 //! ```rust,ignore
 //! use rig::providers::lemonade;
 //! use rig::completion::Prompt;
 //!
-//! // Create a new Lemonade client (defaults to http://localhost:13305)
+//! // Create a new Lemonade client (defaults to http://localhost:13305/api/v1)
 //! let client = lemonade::Client::new();
 //!
 //! // Create an agent with a preamble
@@ -46,10 +49,10 @@ use tracing_futures::Instrument;
 // Main Lemonade Client
 // ================================================================
 
-const LEMONADE_API_BASE_URL: &str = "http://localhost:13305";
+const LEMONADE_API_BASE_URL: &str = "http://localhost:13305/api/v1";
 
 /// Model IDs depend on which models the user has pulled via `lemonade pull`.
-/// Discover available model IDs by querying `GET /api/v1/models` on the running server.
+/// Discover available model IDs by querying `GET /models` on the running server.
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LemonadeExt;
@@ -59,7 +62,7 @@ pub struct LemonadeBuilder;
 
 impl Provider for LemonadeExt {
     type Builder = LemonadeBuilder;
-    const VERIFY_PATH: &'static str = "api/v1/health";
+    const VERIFY_PATH: &'static str = "health";
 }
 
 impl<H> Capabilities<H> for LemonadeExt {
@@ -98,8 +101,8 @@ pub type Client<H = reqwest::Client> = client::Client<LemonadeExt, H>;
 pub type ClientBuilder<H = reqwest::Client> = client::ClientBuilder<LemonadeBuilder, Nothing, H>;
 
 impl Client {
-    /// Create a client pointing at the given Lemonade base URL
-    /// (e.g. `http://localhost:13305`).
+    /// Create a client pointing at the given OpenAI-compatible base URL
+    /// (e.g. `http://localhost:13305/api/v1`).
     pub fn from_url(base_url: &str) -> Self {
         Self::builder()
             .api_key(Nothing)
@@ -278,7 +281,7 @@ where
         let body = serde_json::to_vec(&request)?;
         let req = self
             .client
-            .post("api/v1/chat/completions")?
+            .post("chat/completions")?
             .body(body)
             .map_err(|e| CompletionError::HttpError(e.into()))?;
 
@@ -369,7 +372,7 @@ where
         let body = serde_json::to_vec(&request)?;
         let req = self
             .client
-            .post("api/v1/chat/completions")?
+            .post("chat/completions")?
             .body(body)
             .map_err(|e| CompletionError::HttpError(e.into()))?;
 
@@ -625,7 +628,7 @@ where
 
         let req = self
             .client
-            .post("api/v1/embeddings")?
+            .post("embeddings")?
             .body(body)
             .map_err(|e| EmbeddingError::HttpError(e.into()))?;
 
@@ -690,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_client_from_url() {
-        let _client = Client::from_url("http://localhost:13305");
+        let _client = Client::from_url("http://localhost:13305/api/v1");
     }
 
     #[test]
